@@ -12,7 +12,7 @@ from dataset.video_utils import VIDEO_READER_FUNCS
 logger = logging.getLogger(__name__)
 
 
-class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
+class ITImgTrainDataset_phi(ImageVideoBaseDataset):
     media_type = "image"
 
     def __init__(
@@ -21,7 +21,6 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
         start_token="<Image>", end_token="</Image>",
         random_shuffle=True, # if True, shuffle the QA list
         return_question_instruction=False, # if True, return instruction with instruciton
-        dynamic_config=None, # config for dynamic resolution finetuning
     ):
         super().__init__()
 
@@ -36,17 +35,14 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
             self.anno = json.load(f)
         self.num_examples = len(self.anno)
         self.transform = transform
-        self.dynamic_config = dynamic_config
-        if dynamic_config:
-            logger.info(f"Finetuning with dynamic resolution: {dynamic_config}")
 
         # prompt parameters
         if system:
             assert system[-1] == " ", "' ' should be add in the end of system."
 
-        self.human_start = "[INST]"
-        self.human_end = "[/INST]"
-        self.assist_end = "</s>"
+        self.human_start = "<|user|>\n"
+        self.human_end = "<|end|>\n<|assistant|>\n"
+        self.assist_end = "<|end|>\n"
         self.start_token = start_token
         self.end_token = end_token
         self.system = system
@@ -77,27 +73,29 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
         if self.random_shuffle and len(qa) > 1:
             random.shuffle(qa)
         if "i" in qa[0].keys() and qa[0]["i"] != "":
-            cur_instruction = qa[0]["i"] + " "
+            cur_instruction = qa[0]["i"]
 
         conversation = self.system
         # add instruction as system message
         if cur_instruction:
             conversation += cur_instruction
 
-        # rstrip() for the extra " " in msg
-        conversation += (
-            self.human_start + " " + self.start_token + self.end_token + msg.rstrip() + " " + self.human_end
-        )
+        # add system token
+        if conversation != "":
+            conversation = f"<|system|>\n{conversation}<|end|>\n"
 
-        for _, sentence in enumerate(qa):
+        for idx, sentence in enumerate(qa):
             q = sentence["q"]
             a = sentence["a"]
-            if q != "":
-                conversation += (" " + self.human_start + " " + q + " " + self.human_end)
+            if idx == 0:
+                if q != "":
+                    conversation += (self.human_start + self.start_token + self.end_token + msg.rstrip() + "\n" + q.strip() + self.human_end)
+                else:
+                    # no question, often in caption dataset
+                    conversation += (self.human_start + self.start_token + self.end_token + msg.rstrip() + "\n" + self.human_end)
             else:
-                # no question, often in caption dataset
-                pass
-            conversation += (" " + a + " " + self.assist_end)
+                conversation += (self.human_start + q.strip() + self.human_end)
+            conversation += (a.strip() + self.assist_end)
         
         if self.return_question_instruction and cur_instruction:
             cur_instruction += qa[0]["q"]
@@ -108,7 +106,6 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
             ann = self.get_anno(index)
             image, index = self.load_and_transform_media_data_image(
                 index, ann["image"],
-                dynamic_config=self.dynamic_config
             )
             conversation, instruction = self.process_qa(ann["qa"])
             return image, conversation, instruction, index
@@ -118,7 +115,7 @@ class ITImgTrainDataset_mistral(ImageVideoBaseDataset):
             return self.__getitem__(index)
 
 
-class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
+class ITVidTrainDataset_phi(ITImgTrainDataset_phi):
     media_type = "video"
 
     def __init__(
@@ -128,7 +125,6 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
         add_second_msg=False,
         random_shuffle=True,
         return_question_instruction=False, # if True, return instruction with instruciton
-        dynamic_config=None, # config for dynamic resolution finetuning
     ):
         super().__init__(
             ann_file, transform, 
@@ -136,7 +132,6 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
             start_token=start_token, end_token=end_token,
             random_shuffle=random_shuffle,
             return_question_instruction=return_question_instruction,
-            dynamic_config=dynamic_config,
         )
         self.num_frames = num_frames
         self.video_reader_type = video_reader_type
@@ -158,7 +153,6 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
                 clip = [ann["start"], ann["end"]]
             video, index, sec = self.load_and_transform_media_data_video(
                 index, ann["image"], return_fps=True, clip=clip,
-                dynamic_config=self.dynamic_config
             )
             if self.add_second_msg and sec is not None:
                 # " " should be added in the start and end
@@ -170,85 +164,3 @@ class ITVidTrainDataset_mistral(ITImgTrainDataset_mistral):
             index = np.random.randint(0, len(self))
             return self.__getitem__(index)
 
-
-class ITTextTrainDataset_mistral(ImageVideoBaseDataset):
-    media_type = "text"
-
-    def __init__(
-        self, ann_file, transform, 
-        system="", 
-        start_token=None, end_token=None,
-        random_shuffle=True, # if True, shuffle the QA list
-        return_question_instruction=False, # if True, return instruction with instruciton
-        dynamic_config=None, # config for dynamic resolution finetuning
-    ):
-        super().__init__()
-        self.media_type = "text"  
-
-        self.label_file, self.data_root = ann_file[:2]
-
-        logger.info('Load json file')
-        with open(self.label_file, 'r') as f:
-            self.anno = json.load(f)
-        self.num_examples = len(self.anno)
-
-        # prompt parameters
-        if system:
-            assert system[-1] == " ", "' ' should be add in the end of system."
-
-        self.human_start = "[INST]"
-        self.human_end = "[/INST]"
-        self.assist_end = "</s>"
-        self.start_token = start_token
-        self.end_token = end_token
-        self.system = system
-        self.random_shuffle = random_shuffle
-        # instruction location and number
-        self.return_question_instruction = return_question_instruction
-        logger.info(f"Random shuffle: {self.random_shuffle}")
-        logger.info(f"Return question with instruction: {self.return_question_instruction}")
-
-    def get_anno(self, index):
-        qa = self.anno[index]["QA"]
-        anno = {"qa": qa}
-        return anno
-
-    def __len__(self):
-        return self.num_examples
-    
-    def process_qa(self, qa):
-        cur_instruction = ""
-        # randomly shuffle qa for conversation
-        if self.random_shuffle and len(qa) > 1:
-            random.shuffle(qa)
-        if "i" in qa[0].keys() and qa[0]["i"] != "":
-            cur_instruction = qa[0]["i"] + " "
-
-        conversation = self.system
-        # add instruction as system message
-        if cur_instruction:
-            conversation += cur_instruction
-
-        for _, sentence in enumerate(qa):
-            q = sentence["q"]
-            a = sentence["a"]
-            if q != "":
-                conversation += (" " + self.human_start + " " + q + " " + self.human_end)
-            else:
-                # no question, often in caption dataset
-                pass
-            conversation += (" " + a + " " + self.assist_end)
-        
-        if self.return_question_instruction and cur_instruction:
-            cur_instruction += qa[0]["q"]
-        return conversation.strip(), cur_instruction.strip()
-
-    def __getitem__(self, index):
-        try:
-            ann = self.get_anno(index)
-            conversation, instruction = self.process_qa(ann["qa"])
-            return torch.zeros(1), conversation, instruction, index
-        except Exception as e:
-            logger.warning(f"Caught exception {e} when loading image {ann['image']}")
-            index = np.random.randint(0, len(self))
-            return self.__getitem__(index)

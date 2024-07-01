@@ -4,6 +4,7 @@ import logging
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+import torch.nn.functional as F
 from peft import get_peft_model, LoraConfig, TaskType
 
 from ..blip2.blip2 import Blip2Base, disabled_train
@@ -12,7 +13,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 logger = logging.getLogger(__name__)
 
 
-class VideoChat2_it_mistral(Blip2Base):
+class VideoChat2_it_hd_mistral(Blip2Base):
     """
     VideoChat2 model.
     """
@@ -24,6 +25,7 @@ class VideoChat2_it_mistral(Blip2Base):
         videochat2_model_path = config.get("videochat2_model_path", "")  
         freeze_vit = config.get("freeze_vit", True)
         freeze_qformer = config.get("freeze_qformer", True)
+        freeze_llm = config.get("freeze_llm", True)
         # vit
         low_resource = config.get("low_resource", False) # use 8 bit and put vit in cpu
         # qformer
@@ -45,11 +47,15 @@ class VideoChat2_it_mistral(Blip2Base):
         logger.info(f"Add instruction in qformer: {self.qformer_text_input}")
         # debug
         self.debug = config.get("debug", False)
+        self.llm_bf16 = config.get("llm_bf16", False)
         use_flash_attention = config.get("use_flash_attention", False)
         self.use_lora = config.get("use_lora", False)
         lora_r = config.get("lora_r", 8)
         lora_alpha = config.get("lora_alpha", 32)
         lora_dropout = config.get("lora_dropout", 0.05)
+        # dynamic resolution
+        self.local_size = config.dynamic_config.get("local_size", 224)
+        self.add_global = config.dynamic_config.get("add_global", True)
 
         self.tokenizer = self.init_tokenizer(truncation_side="left")
         self.tokenizer.padding_side = "left"
@@ -125,19 +131,20 @@ class VideoChat2_it_mistral(Blip2Base):
             if use_flash_attention:
                 self.mistral_model = AutoModelForCausalLM.from_pretrained(
                     mistral_model_path,
-                    torch_dtype=torch.float16,
+                    torch_dtype=torch.bfloat16 if self.llm_bf16 else torch.float16,
                     # use_flash_attention_2=True,
                     attn_implementation="flash_attention_2",
                 )
             else:
                 self.mistral_model = AutoModelForCausalLM.from_pretrained(
                     mistral_model_path,
-                    torch_dtype=torch.float16,
+                    torch_dtype=torch.bfloat16 if self.llm_bf16 else torch.float16,
                 )
 
-        logger.info("freeze Mistral")
-        for _, param in self.mistral_model.named_parameters():
-            param.requires_grad = False
+        if freeze_llm:
+            logger.info("freeze Mistral")
+            for _, param in self.mistral_model.named_parameters():
+                param.requires_grad = False
         logger.info('Loading Mistral Done')
 
         if self.use_lora:
@@ -149,6 +156,10 @@ class VideoChat2_it_mistral(Blip2Base):
                                  "gate_proj", "up_proj", "down_proj", "lm_head"]
             )
             self.mistral_model = get_peft_model(self.mistral_model, peft_config)
+            if not freeze_llm:
+                logger.info("Unfreeze Mistral")
+                for _, param in self.mistral_model.base_model.named_parameters():
+                    param.requires_grad = True
             self.mistral_model.print_trainable_parameters()
 
         self.mistral_proj = nn.Linear(
@@ -173,17 +184,38 @@ class VideoChat2_it_mistral(Blip2Base):
         self.vision_encoder.float()
 
     def encode_img(self, image, instruction):
-        device = image.device
+        device = image[0].device
         if self.low_resource:
             self.vit_to_cpu()
-            image = image.to("cpu")
+            image = [img.to("cpu") for img in image]
 
         with self.maybe_autocast():
-            T = image.shape[1]
-            use_image = True if T == 1 else False
-            image = image.permute(0, 2, 1, 3, 4) # [B,T,C,H,W] -> [B,C,T,H,W]
+            # split the image or video according to the shape
+            shapes = []
+            input_imgs = []
+            input_instructions = []
+            for idx, img in enumerate(image):
+                # logger.info(f"Input shape: {img.shape}")
+                T, C, H, W = img.shape
+                shapes.append([H//self.local_size, W//self.local_size])
+                sub_img = img.reshape(
+                    1, T, 3, H//self.local_size, self.local_size, W//self.local_size, self.local_size
+                ).permute(0, 3, 5, 1, 2, 4, 6).reshape(-1, T, 3, self.local_size, self.local_size).contiguous()
+                input_imgs.append(sub_img)
+                input_instructions.extend([instruction[idx]] * len(sub_img))
+                if self.add_global:
+                    glb_img = F.interpolate(
+                        img.float(), size=(self.local_size, self.local_size), mode='bicubic', align_corners=False
+                    ).to(sub_img.dtype)
+                    input_imgs.append(glb_img.unsqueeze(0))
+                    input_instructions.append(instruction[idx])
+            input_imgs = torch.cat(input_imgs, dim=0)
 
-            image_embeds = self.vision_encoder(image, use_image)
+            T = input_imgs.shape[1]
+            use_image = True if T == 1 else False
+            input_imgs = input_imgs.permute(0, 2, 1, 3, 4) # [B,T,C,H,W] -> [B,C,T,H,W]
+
+            image_embeds = self.vision_encoder(input_imgs, use_image)
             B, T, L, C = image_embeds.shape
             image_embeds = image_embeds.reshape(B, -1, C)
             image_embeds = self.vision_layernorm(image_embeds).to(device)  # [B, T*L, C]
@@ -197,7 +229,7 @@ class VideoChat2_it_mistral(Blip2Base):
             query_tokens = query_tokens.expand(image_embeds.shape[0], -1, -1)
             if self.qformer_text_input:
                 text_Qformer = self.tokenizer(
-                    instruction,
+                    input_instructions,
                     padding='longest',
                     truncation=True,
                     max_length=self.max_txt_len,
@@ -222,15 +254,40 @@ class VideoChat2_it_mistral(Blip2Base):
                     return_dict=True,
                 )
 
-            inputs_mistral = self.mistral_proj(query_output.last_hidden_state[:, :query_tokens.size(1), :])
-        return inputs_mistral, use_image
+            qformer_features = self.mistral_proj(query_output.last_hidden_state[:, :query_tokens.size(1), :])
+            q_C = qformer_features.shape[-1]
+
+            # merge the features from different split
+            # stolen from https://huggingface.co/internlm/internlm-xcomposer2-4khd-7b/blob/main/build_mlp.py#L97-L115
+            output_imgs = []
+            output_len = []
+            for [h, w] in shapes:
+                B_ = h * w
+                if self.add_global:
+                    output_imgs.append(qformer_features[:B_+1].view(1, -1, q_C))
+                    qformer_features = qformer_features[B_+1:]
+                else:
+                    output_imgs.append(qformer_features[:B_].view(1, -1, q_C))
+                    qformer_features = qformer_features[B_:]
+                # logger.info(f"Features shape: {output_imgs[-1].shape}")
+                output_len.append(output_imgs[-1].shape[1])
+
+        return output_imgs, output_len, use_image
         
     def _get_text_len(self, text):
         return self.mistral_tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.shape[1]
 
     def forward(self, image, text_input, instruction):
-        img_embeds, use_image = self.encode_img(image, instruction)
-        batch_size, img_len, _ = img_embeds.shape
+        if len(image[0].shape) == 1:
+            use_text = True
+            device = image[0].device
+            batch_size = len(image)
+            img_lens = [0] * batch_size
+        else:
+            use_text = False
+            img_embeds, img_lens, use_image = self.encode_img(image, instruction)
+            device = img_embeds[0].device
+            batch_size = len(img_embeds)
 
         # mark the largest length
         # when padding, the attention mask will be 0
@@ -240,20 +297,29 @@ class VideoChat2_it_mistral(Blip2Base):
         target_list = []
         # handle each prompt individually
         for idx, prompt in enumerate(text_input):
-            tmp_img_embeds = img_embeds[idx].unsqueeze(0)
-            # split the prompt via END_TOKEN
-            end_token = self.img_end_token if use_image else self.end_token
-            p_before, p_after = prompt.split(end_token)
-            p_after = end_token + p_after
-            p_before_tokens = self.mistral_tokenizer(p_before, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
-            p_after_tokens = self.mistral_tokenizer(p_after, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
-            if self.use_lora:
-                p_before_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_before_tokens.input_ids)
-                p_after_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_after_tokens.input_ids)
+            if use_text:
+                p_after = prompt
+                p_after_tokens = self.mistral_tokenizer(p_after, return_tensors="pt", add_special_tokens=False).to(device)
+                if self.use_lora:
+                    p_after_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_after_tokens.input_ids)
+                else:
+                    p_after_embeds = self.mistral_model.model.embed_tokens(p_after_tokens.input_ids)
+                input_embeds = p_after_embeds
             else:
-                p_before_embeds = self.mistral_model.model.embed_tokens(p_before_tokens.input_ids)
-                p_after_embeds = self.mistral_model.model.embed_tokens(p_after_tokens.input_ids)
-            input_embeds = torch.cat([p_before_embeds, tmp_img_embeds, p_after_embeds], dim=1)
+                tmp_img_embeds = img_embeds[idx]
+                # split the prompt via END_TOKEN
+                end_token = self.img_end_token if use_image else self.end_token
+                p_before, p_after = prompt.split(end_token)
+                p_after = end_token + p_after
+                p_before_tokens = self.mistral_tokenizer(p_before, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
+                p_after_tokens = self.mistral_tokenizer(p_after, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
+                if self.use_lora:
+                    p_before_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_before_tokens.input_ids)
+                    p_after_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_after_tokens.input_ids)
+                else:
+                    p_before_embeds = self.mistral_model.model.embed_tokens(p_before_tokens.input_ids)
+                    p_after_embeds = self.mistral_model.model.embed_tokens(p_after_tokens.input_ids)
+                input_embeds = torch.cat([p_before_embeds, tmp_img_embeds, p_after_embeds], dim=1)
 
             # extract the answers and mask the target
             # the answers are only in the p_after
@@ -285,21 +351,25 @@ class VideoChat2_it_mistral(Blip2Base):
 
             max_len = max(max_len, input_embeds.shape[1])
             input_embed_list.append(input_embeds)
-            p_before_len_list.append(p_before_tokens.input_ids.shape[1])
+            if use_text:
+                p_before_len_list.append(0)
+            else:
+                p_before_len_list.append(p_before_tokens.input_ids.shape[1])
             target_list.append(answer_targets)
-        
+   
         # plus one for bos
         # max_txt_len plus num_query_token is the max len
-        txt_len = min(max_len + 1, self.max_txt_len + img_len)
-        inputs_embeds = torch.ones([batch_size, txt_len], dtype=torch.long).to(img_embeds.device) * self.mistral_tokenizer.pad_token_id
+        txt_len = min(max_len + 1, self.max_txt_len + max(img_lens))
+        inputs_embeds = torch.ones([batch_size, txt_len], dtype=torch.long).to(device) * self.mistral_tokenizer.pad_token_id
         if self.use_lora:
             inputs_embeds = self.mistral_model.base_model.model.model.embed_tokens(inputs_embeds)
         else:
             inputs_embeds = self.mistral_model.model.embed_tokens(inputs_embeds)
-        attention_mask = torch.zeros([batch_size, txt_len], dtype=torch.long).to(img_embeds.device)
-        targets = torch.ones([batch_size, txt_len], dtype=torch.long).to(img_embeds.device).fill_(-100)
+        attention_mask = torch.zeros([batch_size, txt_len], dtype=torch.long).to(device)
+        targets = torch.ones([batch_size, txt_len], dtype=torch.long).to(device).fill_(-100)
         # set bos_token
         inputs_embeds[:, :1] = self.mistral_tokenizer.bos_token_id
+        
         for idx in range(batch_size):
             input_len = min(input_embed_list[idx].shape[1], txt_len - 1)
             # if less than txt_len, the input will be padding
@@ -309,7 +379,7 @@ class VideoChat2_it_mistral(Blip2Base):
             attention_mask[idx, :(input_len+1)] = 1
             # the target is -100 when padding
             p_before_len = p_before_len_list[idx]
-            targets[idx, (p_before_len+img_len+1):(input_len+1)] = target_list[idx][0, :(input_len-p_before_len-img_len)]
+            targets[idx, (p_before_len+img_lens[idx]+1):(input_len+1)] = target_list[idx][0, :(input_len-p_before_len-img_lens[idx])]
 
         with self.maybe_autocast():
             outputs = self.mistral_model(

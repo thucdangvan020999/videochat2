@@ -33,7 +33,7 @@ inputs = dict(
 
 # ========================= model ==========================
 model = dict(
-    model_cls="VideoChat2_it_hd_mistral",
+    model_cls="VideoChat2_pt_mistral",
     vit_blip_model_path="your_model_path/videochat2/umt_l16_qformer.pth",
     mistral_model_path="your_model_path/llm/Mistral-7B-Instruct-v0.2",
     gpt_model_path="",

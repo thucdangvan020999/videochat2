@@ -12,7 +12,7 @@ stop_key = None
 # ========================= input ==========================
 num_frames = 8
 num_frames_test = 8
-batch_size = 4
+batch_size = 8
 max_txt_l = 512
 
 pre_text = False
@@ -33,10 +33,10 @@ inputs = dict(
 
 # ========================= model ==========================
 model = dict(
-    model_cls="VideoChat2_it_mistral",
+    model_cls="VideoChat2_it_phi",
     vit_blip_model_path="your_model_path/videochat2/umt_l16_qformer.pth",
-    mistral_model_path="your_model_path/llm//Mistral-7B-Instruct-v0.2",
-    videochat2_model_path="your_model_path/videochat2/videochat2_mistral_7b_stage2.pth",
+    mistral_model_path="your_model_path/llm//Phi-3-mini-128k-instruct",
+    videochat2_model_path="your_model_path/videochat2/videochat2_phi3_stage2.pth",
     freeze_vit=False,
     freeze_qformer=False,
     max_txt_len="${max_txt_l}", # use large max_txt_len on stage3

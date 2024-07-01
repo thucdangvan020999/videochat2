@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 logger = logging.getLogger(__name__)
 
 
-class VideoChat2_it_mistral(Blip2Base):
+class VideoChat2_it_phi(Blip2Base):
     """
     VideoChat2 model.
     """
@@ -20,7 +20,7 @@ class VideoChat2_it_mistral(Blip2Base):
         super().__init__()
         # pretrained_path
         vit_blip_model_path = config.get("vit_blip_model_path", None)
-        mistral_model_path = config.get("mistral_model_path")
+        phi_model_path = config.get("phi_model_path")
         videochat2_model_path = config.get("videochat2_model_path", "")  
         freeze_vit = config.get("freeze_vit", True)
         freeze_qformer = config.get("freeze_qformer", True)
@@ -35,9 +35,9 @@ class VideoChat2_it_mistral(Blip2Base):
         self.qformer_text_input = config.get("qformer_text_input", False)
         # prompt
         max_txt_len = config.get("max_txt_len", 32)
-        self.human_start = "[INST]"
-        self.human_end = "[/INST]"
-        self.assist_end = "</s>"
+        self.human_start = "<|user|>\n"
+        self.human_end = "<|end|>\n<|assistant|>\n"
+        self.assist_end = "<|end|>"
         self.start_token = config.get("start_token", "<Video>")
         self.end_token = config.get("end_token", "</Video>")
         self.img_start_token = config.get("img_start_token", "<Image>")
@@ -105,40 +105,45 @@ class VideoChat2_it_mistral(Blip2Base):
             self.qformer.train = disabled_train
             self.query_tokens.requires_grad = False
 
-        logger.info('Loading Mistral')
-        self.mistral_tokenizer = AutoTokenizer.from_pretrained(mistral_model_path)
-        self.mistral_tokenizer.padding_side = "left"
-        if not self.mistral_tokenizer.pad_token:
+        logger.info('Loading phi')
+        self.phi_tokenizer = AutoTokenizer.from_pretrained(phi_model_path, trust_remote_code=True)
+        self.phi_tokenizer.padding_side = "left"
+        if not self.phi_tokenizer.pad_token:
             logger.info("Set pad_token")
-            self.mistral_tokenizer.pad_token = self.mistral_tokenizer.eos_token
+            self.phi_tokenizer.pad_token = self.phi_tokenizer.eos_token
 
         if self.debug:
-            logger.info("Debug mode, build small Mistral")
-            mistral_config = AutoConfig.from_pretrained(mistral_model_path)
-            mistral_config.hidden_size = 512
-            mistral_config.intermediate_size = 2048
-            mistral_config.num_attention_heads = 8
-            mistral_config.num_hidden_layers = 12
-            mistral_config.torch_dtype = torch.float16
-            self.mistral_model = AutoModelForCausalLM.from_config(mistral_config)
+            logger.info("Debug mode, build small phi")
+            phi_config = AutoConfig.from_pretrained(phi_model_path, trust_remote_code=True)
+            phi_config.hidden_size = 512
+            phi_config.intermediate_size = 2048
+            phi_config.num_attention_heads = 8
+            phi_config.num_hidden_layers = 12
+            phi_config.torch_dtype = torch.float16
+            self.phi_model = AutoModelForCausalLM.from_config(
+                phi_config, trust_remote_code=True,
+                attn_implementation="flash_attention_2",
+            )
         else:
             if use_flash_attention:
-                self.mistral_model = AutoModelForCausalLM.from_pretrained(
-                    mistral_model_path,
+                self.phi_model = AutoModelForCausalLM.from_pretrained(
+                    phi_model_path,
                     torch_dtype=torch.float16,
                     # use_flash_attention_2=True,
                     attn_implementation="flash_attention_2",
+                    trust_remote_code=True
                 )
             else:
-                self.mistral_model = AutoModelForCausalLM.from_pretrained(
-                    mistral_model_path,
+                self.phi_model = AutoModelForCausalLM.from_pretrained(
+                    phi_model_path,
                     torch_dtype=torch.float16,
+                    trust_remote_code=True
                 )
 
-        logger.info("freeze Mistral")
-        for _, param in self.mistral_model.named_parameters():
+        logger.info("freeze phi")
+        for _, param in self.phi_model.named_parameters():
             param.requires_grad = False
-        logger.info('Loading Mistral Done')
+        logger.info('Loading phi Done')
 
         if self.use_lora:
             logger.info("Use lora")
@@ -148,11 +153,11 @@ class VideoChat2_it_mistral(Blip2Base):
                 target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                                  "gate_proj", "up_proj", "down_proj", "lm_head"]
             )
-            self.mistral_model = get_peft_model(self.mistral_model, peft_config)
-            self.mistral_model.print_trainable_parameters()
+            self.phi_model = get_peft_model(self.phi_model, peft_config)
+            self.phi_model.print_trainable_parameters()
 
-        self.mistral_proj = nn.Linear(
-            self.qformer.config.hidden_size, self.mistral_model.config.hidden_size
+        self.phi_proj = nn.Linear(
+            self.qformer.config.hidden_size, self.phi_model.config.hidden_size
         )
         self.max_txt_len = max_txt_len
 
@@ -222,11 +227,11 @@ class VideoChat2_it_mistral(Blip2Base):
                     return_dict=True,
                 )
 
-            inputs_mistral = self.mistral_proj(query_output.last_hidden_state[:, :query_tokens.size(1), :])
-        return inputs_mistral, use_image
+            inputs_phi = self.phi_proj(query_output.last_hidden_state[:, :query_tokens.size(1), :])
+        return inputs_phi, use_image
         
     def _get_text_len(self, text):
-        return self.mistral_tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.shape[1]
+        return self.phi_tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.shape[1]
 
     def forward(self, image, text_input, instruction):
         img_embeds, use_image = self.encode_img(image, instruction)
@@ -245,41 +250,40 @@ class VideoChat2_it_mistral(Blip2Base):
             end_token = self.img_end_token if use_image else self.end_token
             p_before, p_after = prompt.split(end_token)
             p_after = end_token + p_after
-            p_before_tokens = self.mistral_tokenizer(p_before, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
-            p_after_tokens = self.mistral_tokenizer(p_after, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
+            p_before_tokens = self.phi_tokenizer(p_before, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
+            p_after_tokens = self.phi_tokenizer(p_after, return_tensors="pt", add_special_tokens=False).to(tmp_img_embeds.device)
             if self.use_lora:
-                p_before_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_before_tokens.input_ids)
-                p_after_embeds = self.mistral_model.base_model.model.model.embed_tokens(p_after_tokens.input_ids)
+                p_before_embeds = self.phi_model.base_model.model.model.embed_tokens(p_before_tokens.input_ids)
+                p_after_embeds = self.phi_model.base_model.model.model.embed_tokens(p_after_tokens.input_ids)
             else:
-                p_before_embeds = self.mistral_model.model.embed_tokens(p_before_tokens.input_ids)
-                p_after_embeds = self.mistral_model.model.embed_tokens(p_after_tokens.input_ids)
+                p_before_embeds = self.phi_model.model.embed_tokens(p_before_tokens.input_ids)
+                p_after_embeds = self.phi_model.model.embed_tokens(p_after_tokens.input_ids)
             input_embeds = torch.cat([p_before_embeds, tmp_img_embeds, p_after_embeds], dim=1)
 
             # extract the answers and mask the target
             # the answers are only in the p_after
-            sep1 = self.human_start + " "
-            sep2 = " " + self.human_end + " "
+            sep1 = self.human_start
+            sep2 = self.human_end
             raw_text = p_after.split(sep2)
             for idx in range(0, len(raw_text) - 1):
                 raw_text[idx] = raw_text[idx] + sep2
             # the first raw_text contains system and question
             # the last raw_text only contains answer
-            # rstrip() for the extra " "
             answer_targets = p_after_tokens.input_ids.clone()
-            # [target] "xxxxx. </s>"
-            cur_len = self._get_text_len(raw_text[0].rstrip())
+            # [target] "xxxxx. <|end|>"
+            cur_len = self._get_text_len(raw_text[0])
             answer_targets[:, :cur_len] = -100
             for text in raw_text[1:-1]: 
-                total_len = self._get_text_len(text.rstrip())
-                ans_len = self._get_text_len((text.split(sep1)[0]).rstrip())
+                total_len = self._get_text_len(text)
+                ans_len = self._get_text_len((text.split(sep1)[0]))
                 answer_targets[:, (cur_len+ans_len):(cur_len+total_len)] = -100
                 cur_len += total_len
-            cur_len += self._get_text_len(raw_text[-1].rstrip())
+            cur_len += self._get_text_len(raw_text[-1])
 
             if self.debug:  # Inspect and check the correctness of masking
                 z = answer_targets[0].clone()
-                z = torch.where(z == -100, self.mistral_tokenizer.unk_token_id, z)
-                logger.info(self.mistral_tokenizer.decode(z))
+                z = torch.where(z == -100, self.phi_tokenizer.unk_token_id, z)
+                logger.info(self.phi_tokenizer.decode(z))
                 
             assert cur_len == answer_targets.shape[1], f"The final length ({cur_len}) is not equal to the original prompt ({answer_targets.shape[1]}): {prompt}"
 
@@ -291,15 +295,15 @@ class VideoChat2_it_mistral(Blip2Base):
         # plus one for bos
         # max_txt_len plus num_query_token is the max len
         txt_len = min(max_len + 1, self.max_txt_len + img_len)
-        inputs_embeds = torch.ones([batch_size, txt_len], dtype=torch.long).to(img_embeds.device) * self.mistral_tokenizer.pad_token_id
+        inputs_embeds = torch.ones([batch_size, txt_len], dtype=torch.long).to(img_embeds.device) * self.phi_tokenizer.pad_token_id
         if self.use_lora:
-            inputs_embeds = self.mistral_model.base_model.model.model.embed_tokens(inputs_embeds)
+            inputs_embeds = self.phi_model.base_model.model.model.embed_tokens(inputs_embeds)
         else:
-            inputs_embeds = self.mistral_model.model.embed_tokens(inputs_embeds)
+            inputs_embeds = self.phi_model.model.embed_tokens(inputs_embeds)
         attention_mask = torch.zeros([batch_size, txt_len], dtype=torch.long).to(img_embeds.device)
         targets = torch.ones([batch_size, txt_len], dtype=torch.long).to(img_embeds.device).fill_(-100)
         # set bos_token
-        inputs_embeds[:, :1] = self.mistral_tokenizer.bos_token_id
+        inputs_embeds[:, :1] = self.phi_tokenizer.bos_token_id
         for idx in range(batch_size):
             input_len = min(input_embed_list[idx].shape[1], txt_len - 1)
             # if less than txt_len, the input will be padding
@@ -312,12 +316,12 @@ class VideoChat2_it_mistral(Blip2Base):
             targets[idx, (p_before_len+img_len+1):(input_len+1)] = target_list[idx][0, :(input_len-p_before_len-img_len)]
 
         with self.maybe_autocast():
-            outputs = self.mistral_model(
+            outputs = self.phi_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 return_dict=True,
                 labels=targets,
-                use_cache=False, # current flash_attn2 dows not support padding=right for mistral
+                use_cache=False, # current flash_attn2 dows not support padding=right for phi
             )
     
         return dict(
