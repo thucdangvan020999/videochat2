@@ -1,6 +1,6 @@
 {
   "model": {
-    "model_cls": "VideoChat2_it_mistral",
+    "model_cls": "VideoChat2_it_hd_mistral",
     "vit_blip_model_path": "your_model_path/videochat2/umt_l16_qformer.pth",
     "mistral_model_path": "your_model_path/llm//Mistral-7B-Instruct-v0.2",
     "videochat2_model_path": "your_model_path/videochat2/videochat2_mistral_7b_stage2.pth",
@@ -44,7 +44,13 @@
     "use_lora": false,
     "lora_r": 16,
     "lora_alpha": 32,
-    "lora_dropout": 0.1
+    "lora_dropout": 0.1,
+    "dynamic_config": {
+      "local_size": 224,
+      "hd_num": 6,
+      "padding": false,
+      "add_global": true
+    }
   },
   "device": "cuda"
 }

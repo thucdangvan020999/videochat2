@@ -19,11 +19,8 @@ tensorflow==2.16.1
 termcolor==2.4.0
 timm==0.5.4
 tokenizers==0.19.1
-torch
-torchvision
+torch==1.13.1+cu117
+torchvision==0.14.1+cu117
 tqdm==4.66.1
 transformers==4.40.1
 wandb==0.16.1
-fastapi 
-uvicorn 
-python-multipart
